@@ -9382,3 +9382,112 @@ function init(){
 if(document.readyState==='loading') document.addEventListener('DOMContentLoaded',init); else init();
 })();
 </script>
+<script id="mgt-mobile-login-fix">
+(function(){
+  if (typeof SyncManager === 'undefined') return;
+
+  // 1. Charge Supabase avec serveur de secours si jsDelivr ralentit en 4G
+  SyncManager._ensureCDNLoaded = async function() {
+    if (window.supabase && window.supabase.createClient) return true;
+    var urls = [
+      'https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2',
+      'https://unpkg.com/@supabase/supabase-js@2'
+    ];
+    for (var i = 0; i < urls.length; i++) {
+      var ok = await new Promise(function(resolve) {
+        var s = document.createElement('script');
+        var timer = setTimeout(function() { try { s.remove(); } catch(e){} resolve(false); }, 8000);
+        s.onload = function() { clearTimeout(timer); resolve(!!(window.supabase && window.supabase.createClient)); };
+        s.onerror = function() { clearTimeout(timer); try { s.remove(); } catch(e){} resolve(false); };
+        s.src = urls[i];
+        document.head.appendChild(s);
+      });
+      if (ok) return true;
+    }
+    return false;
+  };
+
+  // 2. Ouvre le CRM immédiatement dès que le mot de passe est validé
+  //    et télécharge les clients en arrière-plan
+  SyncManager.connect = async function(cfg, manual) {
+    try {
+      await this.disconnect();
+      if (!cfg || !cfg.url || !cfg.anonKey) { setSyncStatus('Configuration incomplete', 'offline'); return; }
+      if (!window.supabase || !window.supabase.createClient) {
+        var loaded = await this._ensureCDNLoaded();
+        if (!loaded) { setSyncStatus('CDN non charge', 'offline'); toast('Supabase: impossible de charger le CDN.'); return; }
+      }
+      setSyncStatus('Connexion...', 'wait');
+      var client = window.supabase.createClient(cfg.url, cfg.anonKey, {
+        auth: { persistSession: true, autoRefreshToken: true, detectSessionInUrl: false }
+      });
+      this._client = client;
+      this._clientV2 = client;
+      this.status.readyV2 = true;
+      try { await saveSupabaseConfig(cfg); } catch(e) {}
+      this._config = cfg;
+      this._cfg = cfg;
+
+      var sess = await client.auth.getSession();
+      if (cfg.password) {
+        var r = await client.auth.signInWithPassword({ email: cfg.email, password: cfg.password });
+        if (r.error) throw new Error('Auth: ' + r.error.message);
+      } else if (!sess.data || !sess.data.session) {
+        showSyncConfig(true);
+        setSyncStatus('Connexion requise', 'wait');
+        return;
+      }
+
+      var authRes = await client.auth.getUser();
+      if (authRes.error || !authRes.data || !authRes.data.user) throw new Error('Auth: utilisateur introuvable.');
+      var authUser = authRes.data.user;
+      var meta = authUser.user_metadata || {};
+      var authLabel = String(meta.full_name || meta.name || authUser.email || authUser.id || 'Utilisateur MGT').trim();
+      this._authIdentity = { id: String(authUser.id || ''), email: String(authUser.email || cfg.email || ''), label: authLabel };
+      cfg = Object.assign({}, cfg, { email: this._authIdentity.email, user: this._authIdentity.label });
+      try { await saveSupabaseConfig(cfg); } catch(e) {}
+      this._config = cfg;
+      this._cfg = cfg;
+
+      // Déverrouille immédiatement l'accès au CRM
+      this.status.ready = true;
+      this.status.connectionMode = 'v2';
+      this.status.statusText = 'online';
+      try { localStorage.setItem('mgt_sync_v2_enabled', 'true'); } catch(e) {}
+      setSyncStatus('Synchronise', 'online');
+      showSyncConfig(false);
+
+      // Télécharge et synchronise les clients en arrière-plan
+      var self = this;
+      (async function() {
+        try { await self.processLocalQueue(); } catch(e) { console.warn(e); }
+        try { await refreshPendingCache(); } catch(e) {}
+        try { await self.pullFromSupabase(false); } catch(e) { console.warn(e); }
+        try { await self._syncV2Pull(); } catch(e) { console.warn(e); }
+        try {
+          await rebuildClientCache();
+          refreshFilters();
+          updateStats();
+          render();
+        } catch(e) {}
+        try {
+          self._channel = client.channel('mgt_events_realtime_v1')
+            .on('postgres_changes', { event: 'INSERT', schema: 'public', table: SYNC_V2_EVENTS_TABLE }, function(p) {
+              if (p.new && p.new.device_id !== SYNC_DEVICE_ID) {
+                if (state.edit) { self._pendingRealtime = true; return; }
+                self._debouncedPull();
+              }
+            })
+            .subscribe(function(s) { if (s === 'SUBSCRIBED') setSyncStatus('Synchronise', 'online'); });
+        } catch(e) {}
+      })();
+    } catch (err) {
+      this.status.ready = false;
+      this.status.connectionMode = 'offline';
+      setSyncStatus('Erreur Supabase', 'offline');
+      toast('Supabase: ' + (err && err.message ? err.message : err));
+    }
+  };
+})();
+  </script>
+  
